@@ -1,144 +1,91 @@
 import os
+from bs4 import BeautifulSoup
 import json
 from datetime import datetime
 import re
 
 def parse_datetime(dt_str):
     """Convert datetime string to millisecond timestamp"""
-    dt = datetime.strptime(dt_str, '%b %d, %Y %I:%M:%S %p')
+    # Remove any text in parentheses
+    dt_str = re.sub(r'\s*\([^)]*\)', '', dt_str)
+    dt = datetime.strptime(dt_str.strip(), '%b %d, %Y %I:%M:%S %p')
     return int(dt.timestamp() * 1000)
 
-def parse_message_file(file_path):
+def get_number_from_filename(file_path):
+    """Extract recipient number from the HTML filename"""
+    base_name = os.path.basename(file_path)
+    match = re.search(r'(\+\d+)', base_name)
+    if match:
+        number = match.group(1)
+        # Remove any formatting from the phone number
+        return re.sub(r'[^0-9+]', '', number)
+    return None
+
+def parse_html_file(file_path):
     messages = []
-    current_message = None
+    thread_number = get_number_from_filename(file_path)
     
     with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+        soup = BeautifulSoup(f.read(), 'html.parser')
         
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Try to match datetime pattern
-        date_match = re.match(r'([A-Z][a-z]{2} \d{1,2}, \d{4}\s+\d{1,2}:\d{2}:\d{2} [AP]M)', line)
-        
-        if date_match:
-            if current_message:
-                messages.append(current_message)
-                
-            dt_str = date_match.group(1)
-            timestamp = parse_datetime(dt_str)
-            
-            # Check if there's read status
-            read_status = 1  # Default to read
-            if "(Read by you after" in line:
-                read_status = 1
-            
-            current_message = {
-                "subscriptionId": 1,  # Default to 1
-                "address": "",
-                "body": "",
-                "date": timestamp,
-                "dateSent": 0,  # Default to 0
-                "locked": 0,  # Default to unlocked
-                "protocol": None,  # Default to None
-                "read": read_status,
-                "status": -1,  # Default to -1 (status unknown)
-                "type": 1,  # Default to received
-                "serviceCenter": None,  # Default to None
-                "backupType": "sms",  # Default to sms
-            }
-            continue
-            
-        # Check for phone number
-        if line.startswith('+'):
-            current_message["address"] = line
-            continue
-            
-        # Check for sender indicator
-        if line == "Me":
-            if current_message:
-                current_message["type"] = 2  # Sent message
-            continue
-            
-        # Check for deleted message
-        if line == "This message was deleted from the conversation!":
-            if current_message:
-                current_message["deleted"] = True
-            continue
-            
-        # Check for reactions (Tapbacks)
-        if line.startswith("Tapbacks:"):
-            if current_message:
-                # Parse next line(s) for reactions until we hit a non-reaction line
-                j = i + 1
-                while j < len(lines) and not lines[j].strip().startswith(('Feb', 'Mar', 'Jan', '+', 'Me')):
-                    reaction_line = lines[j].strip()
-                    if reaction_line:
-                        # Parse reaction line (e.g., "❤️ by +15147071515")
-                        reaction_parts = reaction_line.split(' by ')
-                        if len(reaction_parts) == 2:
-                            current_message["reactions"].append({
-                                "emoji": reaction_parts[0].strip(),
-                                "sender": reaction_parts[1].strip()
-                            })
-                    j += 1
-            continue
-            
-        # Add to message body if not a reaction line
-        if current_message and not line.startswith("Tapbacks:"):
-            if current_message["body"]:
-                current_message["body"] += "\n"
-            current_message["body"] += line
+    message_divs = soup.find_all('div', class_='message')
     
-    # Add the last message
-    if current_message:
-        messages.append(current_message)
+    for message_div in message_divs:
+        message_container = message_div.find('div', class_=['sent', 'received'])
+        if not message_container:
+            continue
+            
+        is_sent = 'sent' in message_container.get('class', [])
+        message_type = 2 if is_sent else 1  # 1 for received, 2 for sent
         
+        timestamp_span = message_container.find('span', class_='timestamp')
+        bubble_span = message_container.find('span', class_='bubble')
+        
+        if not timestamp_span or not bubble_span:
+            continue
+            
+        address = thread_number
+        timestamp = parse_datetime(timestamp_span.text)
+        
+        message = {
+            "phone_number": address,
+            "text": bubble_span.text.strip(),
+            "timestamp": timestamp,
+            "type": message_type,
+            "read": 1,
+            "thread_id": abs(hash(address)) % (10 ** 8)  # Generate consistent thread ID from phone number
+        }
+        
+        messages.append(message)
+    
     return messages
-
-def get_thread_id(filename):
-    """Extract thread ID from filename or generate a hash if no numbers found"""
-    numbers = ''.join(filter(str.isdigit, filename))
-    if numbers:
-        return int(numbers)
-    else:
-        # If no numbers in filename, use a hash of the filename
-        return abs(hash(filename)) % (10 ** 8)  # Limit to 8 digits
 
 def convert_files_to_json(folder_path):
     all_messages = []
-    thread_counter = 1
     
-    # Process all .txt files in the folder
     for filename in os.listdir(folder_path):
-        if filename.endswith('.txt'):
+        if filename.endswith('.html'):
             file_path = os.path.join(folder_path, filename)
-            
-            # Get thread_id from filename or generate one
-            thread_id = get_thread_id(filename)
-            
             try:
-                messages = parse_message_file(file_path)
-                
-                # Assign thread_id to all messages from this file
-                for msg in messages:
-                    msg["thread_id"] = thread_id
-                
+                messages = parse_html_file(file_path)
                 all_messages.extend(messages)
-                print(f"Processed {filename} - Thread ID: {thread_id}")
+                print(f"Processed {filename} - {len(messages)} messages")
             except Exception as e:
                 print(f"Error processing {filename}: {str(e)}")
                 continue
     
-    # Sort messages by date
-    all_messages.sort(key=lambda x: x["date"])
+    # Sort messages by timestamp
+    all_messages.sort(key=lambda x: x["timestamp"])
     
-    # Write to output file
-    output_path = os.path.join(folder_path, 'messages_export.json')
+    # Create the proper backup structure
+    backup_data = {
+        "version": 1,
+        "messages": all_messages
+    }
+    
+    output_path = os.path.join(folder_path, 'messages_backup.json')
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(all_messages, f, ensure_ascii=False, indent=2)
+        json.dump(backup_data, f, ensure_ascii=False, indent=2)
     
     return output_path
 
